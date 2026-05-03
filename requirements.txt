@@ -1,0 +1,5 @@
+dagster>=1.8
+dagster-webserver>=1.8
+girder-client>=3.2
+python-dateutil>=2.8
+pydantic>=2

@@ -1,0 +1,16 @@
+services:
+  dagster:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      GIRDER_API_URL: ${GIRDER_API_URL}
+      GIRDER_API_KEY: ${GIRDER_API_KEY}
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - dagster_home:/tmp/dagster_home
+
+volumes:
+  dagster_home:
