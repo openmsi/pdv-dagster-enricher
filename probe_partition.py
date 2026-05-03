@@ -2,10 +2,11 @@
 
 Reads GIRDER_API_URL, GIRDER_API_KEY, BASE_PARENT_ID, and BASE_PARENT_TYPE
 (default "folder") from the environment, authenticates a GirderClient, and
-tries three filter modes against /aimdl/partition with limit=5, offset=0.
-Prints a header per mode, the params used, and the first ~4000 chars of the
-response body (or the exception). Ends with a summary line of which modes
-returned a non-empty result list.
+calls /aimdl/partition twice with the canonical filter dataType=pdv_trace —
+once at offset=0 and once at offset=5 — to settle response shape and
+whether offset actually advances. Prints a header per call, the params
+used, and the first ~4000 chars of the response body (or the exception).
+Ends with a summary of record counts per call.
 
 This script intentionally does not depend on Dagster.
 """
@@ -19,7 +20,6 @@ import girder_client
 
 PREVIEW_CHARS = 4000
 LIMIT = 5
-OFFSET = 0
 
 
 def records_from_response(response):
@@ -58,27 +58,20 @@ def main() -> int:
     base_params = {
         "parentId": parent_id,
         "parentType": parent_type,
-        "offset": OFFSET,
+        "dataType": "pdv_trace",
         "limit": LIMIT,
     }
 
     modes = {
-        "data_type_param": {**base_params, "data_type": "pdv_trace"},
-        "query_json": {
-            **base_params,
-            "query": json.dumps({"meta.data_type": "pdv_trace"}),
-        },
-        "filter_json": {
-            **base_params,
-            "filter": json.dumps({"data_type": "pdv_trace"}),
-        },
+        "offset_0": {**base_params, "offset": 0},
+        "offset_5": {**base_params, "offset": LIMIT},
     }
 
     results: dict[str, int] = {}
 
     for mode, params in modes.items():
         print("=" * 72)
-        print(f"MODE: {mode}")
+        print(f"CALL: {mode}")
         print(f"PARAMS: {params}")
         try:
             response = client.get("aimdl/partition", parameters=params)
