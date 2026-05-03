@@ -4,7 +4,6 @@
 # string annotations defer evaluation, which breaks that lookup.
 
 import re
-from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 import dagster as dg
@@ -15,31 +14,13 @@ from girder_client import GirderClient
 
 
 # ---------------------------------------------------------------------------
-# Verbatim copy of extract_igsn() and parse_date() from
+# Verbatim copy of parse_date() from
 #   xarthisius/girder-consumers/common/base.py
 # Source path:
 #   /Users/elbert/Documents/GitHub/xarthisius/girder-consumers/common/base.py
 # Kept verbatim (modulo this attribution) so behavior matches the upstream
-# consumers exactly. Update both sides together if either changes.
+# helix uploader exactly. Update both sides together if either changes.
 # ---------------------------------------------------------------------------
-
-igsn_pattern = re.compile(r"^[A-Z]{6}[0-9]{5}[A-Z0-9\-]*$", re.IGNORECASE)
-
-
-def extract_igsn(filepath):
-    """Find the first IGSN in any component of *filepath*.
-
-    Tests the first underscore-delimited token of each path part, which
-    handles both bare IGSN folder names and filenames/folder names like
-    ``JHAMAL00004-01_abc_2026-04-15_...csv``.
-    Returns the IGSN string (upper-cased) or ``None`` if not found.
-    """
-    for part in filepath.parts:
-        candidate = part.split("_")[0]
-        if igsn_pattern.match(candidate):
-            return candidate.upper()
-    return None
-
 
 _date_time_pattern = re.compile(
     r"(?<![0-9])(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})(?![0-9])"
@@ -88,19 +69,18 @@ class GirderResource(dg.ConfigurableResource):
 # ---------------------------------------------------------------------------
 
 
+# Server-side limit cap; girder-jsonforms aimdl.py:254 rejects > 100.
+MAX_LIMIT = 100
+
+
 class EnrichConfig(dg.Config):
     base_parent_id: str
-    base_parent_type: Literal["folder", "collection"] = "folder"
+    base_parent_type: Literal["collection", "user"] = "collection"
     dry_run: bool = True
     preflight_only: bool = False
     overwrite_existing: bool = False
-    limit: int = 100
+    limit: int = MAX_LIMIT
     max_pages: int = 100
-    partition_filter_mode: Literal[
-        "data_type_param", "query_json", "filter_json"
-    ] = "data_type_param"
-    pagination_mode: Literal["offset_limit", "single_page"] = "offset_limit"
-    extra_partition_params: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -108,105 +88,53 @@ class EnrichConfig(dg.Config):
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class PartitionRecord:
-    item_id: Optional[str]
-    name: Optional[str]
-    path: Optional[str]
-    metadata: dict[str, Any] = field(default_factory=dict)
+def build_datafiles_params(config: EnrichConfig, *, offset: int) -> dict[str, Any]:
+    """Build query params for /aimdl/datafiles.
 
-
-def build_partition_params(config: EnrichConfig, *, offset: int, limit: int) -> dict[str, Any]:
-    """Build query params for /aimdl/partition based on the chosen filter mode."""
-    params: dict[str, Any] = {
-        "parentId": config.base_parent_id,
-        "parentType": config.base_parent_type,
+    sort=_id is forced. The endpoint's default sort is `lowerName`, but
+    pdv_trace items have many duplicate names (an item and its
+    `copyOfItem` share a `name`) and MongoDB sort+skip+limit is not
+    stable under ties — the same _id can appear on consecutive pages or
+    be skipped entirely. Sorting by the unique _id makes pagination
+    stable.
+    """
+    return {
+        "baseParentId": config.base_parent_id,
+        "baseParentType": config.base_parent_type,
+        "dataType": "pdv_trace",
+        "sort": "_id",
+        "offset": offset,
+        "limit": min(config.limit, MAX_LIMIT),
     }
 
-    if config.pagination_mode == "offset_limit":
-        params["offset"] = offset
-        params["limit"] = limit
-    elif config.pagination_mode == "single_page":
-        params["limit"] = limit
-    else:
-        raise ValueError(f"Unknown pagination_mode: {config.pagination_mode}")
 
-    if config.partition_filter_mode == "data_type_param":
-        params["data_type"] = "pdv_trace"
-    elif config.partition_filter_mode == "query_json":
-        import json
-        params["query"] = json.dumps({"meta.data_type": "pdv_trace"})
-    elif config.partition_filter_mode == "filter_json":
-        import json
-        params["filter"] = json.dumps({"data_type": "pdv_trace"})
-    else:
-        raise ValueError(
-            f"Unknown partition_filter_mode: {config.partition_filter_mode}"
-        )
+def normalize_item(raw: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """Return (item_id, name) from a /aimdl/datafiles record, or None.
 
-    if config.extra_partition_params:
-        params.update(config.extra_partition_params)
-
-    return params
-
-
-def get_partition_page(client: GirderClient, params: dict[str, Any]) -> Any:
-    """Single GET against /aimdl/partition. Returns the raw decoded JSON."""
-    return client.get("aimdl/partition", parameters=params)
-
-
-def records_from_partition_response(response: Any) -> list[dict[str, Any]]:
-    """Coerce the partition response into a flat list of record dicts.
-
-    The endpoint contract is not yet pinned down. Tolerate:
-      - a bare list of records
-      - a dict with one of: results, files, items, data
-    Anything else returns an empty list.
+    The endpoint filters by meta.igsn and meta.data_type=pdv_trace
+    server-side (girder-jsonforms aimdl.py:259-262), so neither needs
+    re-checking here. Only _id (to address the item) and name (to parse
+    the date from) are required downstream.
     """
-    if isinstance(response, list):
-        return response
-    if isinstance(response, dict):
-        for key in ("results", "files", "items", "data"):
-            value = response.get(key)
-            if isinstance(value, list):
-                return value
-    return []
+    item_id = raw.get("_id")
+    name = raw.get("name")
+    if isinstance(item_id, str) and isinstance(name, str):
+        return item_id, name
+    return None
 
 
-def normalize_partition_record(raw: dict[str, Any]) -> PartitionRecord:
-    """Best-effort mapping of a raw partition record to PartitionRecord.
+def fetch_existing_experiment_date(
+    client: GirderClient, item_id: str
+) -> Optional[str]:
+    """Return meta.experiment_date for *item_id*, or None if absent.
 
-    Defensive across likely shapes — partition records may inline metadata
-    at the top level, nest it under ``meta``, or split path/name fields.
+    /aimdl/datafiles does not project meta.experiment_date, so when
+    overwrite_existing=False we have to read the item directly to honor
+    the policy. Doubles the round-trip count during backfill — acceptable
+    for a one-shot tool, and skipped when overwrite_existing=True.
     """
-    if not isinstance(raw, dict):
-        return PartitionRecord(item_id=None, name=None, path=None, metadata={})
-
-    item_id = (
-        raw.get("itemId")
-        or raw.get("item_id")
-        or raw.get("_id")
-        or raw.get("id")
-    )
-
-    name = raw.get("name") or raw.get("filename")
-    path = raw.get("path") or raw.get("fullpath") or raw.get("relpath")
-
-    metadata = {}
-    if isinstance(raw.get("meta"), dict):
-        metadata.update(raw["meta"])
-    if isinstance(raw.get("metadata"), dict):
-        metadata.update(raw["metadata"])
-    # Some shapes inline data_type at the top level.
-    if "data_type" in raw and "data_type" not in metadata:
-        metadata["data_type"] = raw["data_type"]
-
-    return PartitionRecord(
-        item_id=item_id,
-        name=name,
-        path=path,
-        metadata=metadata,
-    )
+    item = client.get(f"item/{item_id}")
+    return (item.get("meta") or {}).get("experiment_date")
 
 
 def add_metadata_to_item(
@@ -215,9 +143,15 @@ def add_metadata_to_item(
     client.addMetadataToItem(item_id, metadata)
 
 
-def record_identity(rec: PartitionRecord) -> tuple:
-    """Stable identity tuple for detecting duplicate pages."""
-    return (rec.item_id, rec.path, rec.name)
+def _run_metadata(config: EnrichConfig, *, preflight_only: bool) -> dict[str, Any]:
+    return {
+        "base_parent_id": config.base_parent_id,
+        "base_parent_type": config.base_parent_type,
+        "dry_run": config.dry_run,
+        "preflight_only": preflight_only,
+        "overwrite_existing": config.overwrite_existing,
+        "limit": min(config.limit, MAX_LIMIT),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -230,64 +164,60 @@ def run_preflight(
     config: EnrichConfig,
     client: GirderClient,
 ) -> None:
-    """Sanity-check the partition contract before we start writing.
+    """Sanity-check /aimdl/datafiles before pagination starts.
 
-    Always called before pagination. Raises on anything that would make the
-    main loop unsafe (no records, missing item_ids, ignored offset).
+    Confirms page 0 returns records with the expected shape, and — when
+    page 0 is full — that offset actually advances under sort=_id.
     """
     log = context.log
 
-    page0_params = build_partition_params(config, offset=0, limit=config.limit)
+    page0_params = build_datafiles_params(config, offset=0)
     log.info(f"[preflight] page 0 params: {page0_params}")
-    page0_response = get_partition_page(client, page0_params)
-    page0_raw = records_from_partition_response(page0_response)
-    page0 = [normalize_partition_record(r) for r in page0_raw]
+    page0 = client.get("aimdl/datafiles", parameters=page0_params)
 
-    sample_size = len(page0)
-    missing_item_id = sum(1 for r in page0 if not r.item_id)
-    missing_path = sum(1 for r in page0 if not r.path)
-    missing_data_type = sum(1 for r in page0 if "data_type" not in r.metadata)
-    explicit_pdv_trace = sum(
-        1 for r in page0 if r.metadata.get("data_type") == "pdv_trace"
-    )
+    if not isinstance(page0, list):
+        raise RuntimeError(
+            f"Preflight failed: /aimdl/datafiles returned {type(page0).__name__}, "
+            f"expected list. Body: {page0!r}"
+        )
+    if not page0:
+        raise RuntimeError(
+            "Preflight failed: /aimdl/datafiles returned zero records for "
+            f"baseParentId={config.base_parent_id} "
+            f"baseParentType={config.base_parent_type}. "
+            "Check parent id, parent type, and that the parent contains "
+            "pdv_trace items with meta.igsn set."
+        )
+
+    sample = page0[:5]
+    missing_id = sum(1 for r in sample if not r.get("_id"))
+    missing_name = sum(1 for r in sample if not r.get("name"))
 
     log.info(
-        "[preflight] sample summary: "
-        f"sample_size={sample_size} "
-        f"missing_item_id={missing_item_id} "
-        f"missing_path={missing_path} "
-        f"missing_data_type={missing_data_type} "
-        f"explicit_pdv_trace={explicit_pdv_trace}"
+        f"[preflight] page 0: {len(page0)} record(s); "
+        f"missing_id={missing_id} missing_name={missing_name}"
     )
-    if page0:
-        log.info(f"[preflight] first normalized record: {page0[0].__dict__}")
+    log.info(f"[preflight] first record: {page0[0]!r}")
 
-    if sample_size == 0:
+    if missing_id or missing_name:
         raise RuntimeError(
-            "Preflight failed: /aimdl/partition returned zero records for "
-            f"parent {config.base_parent_type}={config.base_parent_id}. "
-            "Check parent id, filter mode, and that the parent contains pdv_trace items."
-        )
-    if missing_item_id:
-        raise RuntimeError(
-            f"Preflight failed: {missing_item_id}/{sample_size} records are "
-            "missing item_id. Cannot enrich items we cannot address. "
-            "Inspect the raw response shape and adjust normalize_partition_record."
+            "Preflight failed: records missing _id or name in sample of 5. "
+            f"missing_id={missing_id} missing_name={missing_name}"
         )
 
-    if config.pagination_mode == "offset_limit" and sample_size == config.limit:
-        page1_params = build_partition_params(
-            config, offset=config.limit, limit=config.limit
-        )
+    limit = min(config.limit, MAX_LIMIT)
+    if len(page0) >= limit:
+        page1_params = build_datafiles_params(config, offset=limit)
         log.info(f"[preflight] page 1 params (offset check): {page1_params}")
-        page1_response = get_partition_page(client, page1_params)
-        page1_raw = records_from_partition_response(page1_response)
-        page1 = [normalize_partition_record(r) for r in page1_raw]
-        if page1 and record_identity(page1[0]) == record_identity(page0[0]):
+        page1 = client.get("aimdl/datafiles", parameters=page1_params)
+        if (
+            isinstance(page1, list)
+            and page1
+            and page1[0].get("_id") == page0[0].get("_id")
+        ):
             raise RuntimeError(
-                "Preflight failed: page 1 first record matches page 0 first record. "
-                "The /aimdl/partition endpoint appears to ignore offset; pagination "
-                "would loop forever. Switch pagination_mode or fix the call shape."
+                "Preflight failed: page 1 first _id matches page 0 first _id "
+                "even with sort=_id. Pagination would loop forever."
             )
 
 
@@ -313,35 +243,34 @@ def enrich_pdv_trace_experiment_dates(
         "would_update": 0,
         "skipped_no_date": 0,
         "skipped_existing_date": 0,
-        "skipped_wrong_data_type": 0,
+        "skipped_malformed": 0,
         "errors": 0,
     }
 
     if config.preflight_only:
         log.info("[asset] preflight_only=True, returning without paginating.")
         context.add_output_metadata(
-            {
-                **counters,
-                "base_parent_id": config.base_parent_id,
-                "base_parent_type": config.base_parent_type,
-                "dry_run": config.dry_run,
-                "preflight_only": True,
-                "partition_filter_mode": config.partition_filter_mode,
-                "pagination_mode": config.pagination_mode,
-            }
+            {**counters, **_run_metadata(config, preflight_only=True)}
         )
         return
 
-    from pathlib import PurePosixPath
+    limit = min(config.limit, MAX_LIMIT)
 
     for page_index in range(config.max_pages):
-        offset = page_index * config.limit
-        params = build_partition_params(config, offset=offset, limit=config.limit)
+        offset = page_index * limit
+        params = build_datafiles_params(config, offset=offset)
         log.info(f"[page {page_index}] params: {params}")
-        response = get_partition_page(girder, params)
-        raw_records = records_from_partition_response(response)
+        page = girder.get("aimdl/datafiles", parameters=params)
 
-        if not raw_records:
+        if not isinstance(page, list):
+            log.error(
+                f"[page {page_index}] unexpected response type: "
+                f"{type(page).__name__}; stopping pagination."
+            )
+            counters["errors"] += 1
+            break
+
+        if not page:
             log.info(f"[page {page_index}] empty page, stopping pagination.")
             break
 
@@ -351,59 +280,43 @@ def enrich_pdv_trace_experiment_dates(
             "would_update": 0,
             "skipped_no_date": 0,
             "skipped_existing_date": 0,
-            "skipped_wrong_data_type": 0,
+            "skipped_malformed": 0,
             "errors": 0,
         }
 
-        for raw in raw_records:
+        for raw in page:
+            page_counters["scanned"] += 1
             try:
-                rec = normalize_partition_record(raw)
-                page_counters["scanned"] += 1
-
-                record_data_type = rec.metadata.get("data_type")
-                # Trust the server when data_type is missing; only skip on
-                # explicit mismatch.
-                if record_data_type not in (None, "pdv_trace"):
-                    page_counters["skipped_wrong_data_type"] += 1
-                    continue
-
-                if not rec.item_id:
+                norm = normalize_item(raw)
+                if norm is None:
                     log.warning(
-                        f"[page {page_index}] record missing item_id, skipping: {raw!r}"
+                        f"[page {page_index}] malformed record, skipping: {raw!r}"
                     )
-                    page_counters["errors"] += 1
+                    page_counters["skipped_malformed"] += 1
                     continue
+                item_id, name = norm
 
-                name_for_date = rec.name or rec.path or ""
-                parsed = parse_date(name_for_date, log)
-
+                parsed = parse_date(name, log)
                 if "experiment_date" not in parsed:
                     page_counters["skipped_no_date"] += 1
                     continue
 
-                existing = rec.metadata.get("experiment_date")
-                if existing and not config.overwrite_existing:
-                    page_counters["skipped_existing_date"] += 1
-                    continue
+                if not config.overwrite_existing:
+                    existing = fetch_existing_experiment_date(girder, item_id)
+                    if existing:
+                        page_counters["skipped_existing_date"] += 1
+                        continue
 
-                update: dict[str, Any] = {
-                    "experiment_date": parsed["experiment_date"],
-                }
-
-                # IGSN is identity-like metadata, fill only when absent.
-                if not rec.metadata.get("igsn") and rec.path:
-                    igsn = extract_igsn(PurePosixPath(rec.path))
-                    if igsn:
-                        update["igsn"] = igsn
+                update = {"experiment_date": parsed["experiment_date"]}
 
                 if config.dry_run:
                     page_counters["would_update"] += 1
                     log.info(
                         f"[page {page_index}] DRY RUN would update "
-                        f"item_id={rec.item_id} with {update}"
+                        f"item_id={item_id} name={name!r} with {update}"
                     )
                 else:
-                    add_metadata_to_item(girder, rec.item_id, update)
+                    add_metadata_to_item(girder, item_id, update)
                     page_counters["updated"] += 1
 
             except Exception as exc:
@@ -418,36 +331,25 @@ def enrich_pdv_trace_experiment_dates(
         counters["pages"] += 1
 
         log.info(
-            f"[page {page_index} summary] "
-            f"offset={offset} "
+            f"[page {page_index} summary] offset={offset} "
             f"scanned={page_counters['scanned']} "
             f"updated={page_counters['updated']} "
             f"would_update={page_counters['would_update']} "
             f"skipped_no_date={page_counters['skipped_no_date']} "
             f"skipped_existing_date={page_counters['skipped_existing_date']} "
-            f"skipped_wrong_data_type={page_counters['skipped_wrong_data_type']} "
+            f"skipped_malformed={page_counters['skipped_malformed']} "
             f"errors={page_counters['errors']}"
         )
 
-        if config.pagination_mode == "single_page":
-            break
-        if len(raw_records) < config.limit:
+        if len(page) < limit:
             log.info(
-                f"[page {page_index}] short page ({len(raw_records)} < {config.limit}), "
+                f"[page {page_index}] short page ({len(page)} < {limit}), "
                 "stopping pagination."
             )
             break
 
     context.add_output_metadata(
-        {
-            **counters,
-            "base_parent_id": config.base_parent_id,
-            "base_parent_type": config.base_parent_type,
-            "dry_run": config.dry_run,
-            "preflight_only": False,
-            "partition_filter_mode": config.partition_filter_mode,
-            "pagination_mode": config.pagination_mode,
-        }
+        {**counters, **_run_metadata(config, preflight_only=False)}
     )
 
 

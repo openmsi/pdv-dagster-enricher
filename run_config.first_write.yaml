@@ -1,13 +1,10 @@
 ops:
   enrich_pdv_trace_experiment_dates:
     config:
-      base_parent_id: "PUT_FOLDER_OR_COLLECTION_ID_HERE"
-      base_parent_type: "folder"
+      base_parent_id: "PUT_COLLECTION_OR_USER_ID_HERE"
+      base_parent_type: "collection"  # or "user"
       dry_run: false
       preflight_only: false
       overwrite_existing: false
       limit: 100
       max_pages: 1
-      partition_filter_mode: "data_type_param"
-      pagination_mode: "offset_limit"
-      extra_partition_params: {}

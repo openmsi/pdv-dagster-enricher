@@ -2,16 +2,19 @@
 
 ## What this is
 
-A small, containerized Dagster workflow that enriches Girder `pdv_trace`
-items with `experiment_date` (and `igsn` when absent) by walking the
-AIMD-L `/aimdl/partition` endpoint, parsing dates out of file/folder
-names, and writing metadata back via the Girder REST API.
+A small, containerized Dagster workflow that backfills `experiment_date`
+metadata onto Girder `pdv_trace` items by walking the AIMD-L
+`/aimdl/datafiles` endpoint, parsing dates out of file names, and
+writing the metadata back via the Girder REST API. Intended as a
+one-shot backfill — the upstream helix uploader writes
+`experiment_date` on new uploads once it is deployed in production.
 
 ## Prerequisites
 
-- Docker / Docker Compose
+- Docker / Docker Compose (or a local Python ≥3.12 venv)
 - A Girder API key with metadata-write permission on the target items
-- The Girder id of the folder or collection you want to enrich
+- The Girder id of the **collection or user** you want to enrich
+  (folder ids are not accepted by `/aimdl/datafiles`)
 
 ## Quickstart
 
@@ -23,14 +26,16 @@ Run these in order. Do **not** skip the dry run.
    # then edit .env to set GIRDER_API_URL and GIRDER_API_KEY
    ```
 
-2. **Probe the partition endpoint** to discover the filter and pagination
-   contract before wiring up the asset:
+2. **Probe the endpoint** to confirm reachability and inspect a sample
+   record before wiring up the asset:
    ```
-   docker compose run --rm dagster python probe_partition.py
+   export BASE_PARENT_ID=...        # collection or user id
+   export BASE_PARENT_TYPE=collection   # or "user"
+   python probe_partition.py
    ```
-   (or run `probe_partition.py` directly with the env vars exported).
-   Note which mode returned non-empty results — you will set
-   `partition_filter_mode` accordingly in the run configs.
+   Confirm in the output that `offset advances: YES` and that the
+   sampled item's `meta.experiment_date present` reflects the state you
+   expect (typically `False` for backfill targets).
 
 3. **Launch Dagster:**
    ```
@@ -40,8 +45,8 @@ Run these in order. Do **not** skip the dry run.
 
 4. **Materialize `enrich_pdv_trace_experiment_dates` with
    `run_config.preflight.yaml`.** Replace
-   `PUT_FOLDER_OR_COLLECTION_ID_HERE` first. Inspect the preflight summary
-   and the first normalized record in the logs.
+   `PUT_COLLECTION_OR_USER_ID_HERE` first. Inspect the preflight summary
+   and the first record in the logs.
 
 5. **Then run with `run_config.dry_run.yaml`.** Confirm the per-page
    counters look sane and that `would_update` matches your expectations.
@@ -53,7 +58,7 @@ Run these in order. Do **not** skip the dry run.
 ## Design
 
 See [DECISIONS.md](DECISIONS.md) for the locked design choices, the
-open questions the probe + preflight resolve, and the hard footguns.
+endpoint contract notes, and the hard footguns.
 
 ## Scope note
 
