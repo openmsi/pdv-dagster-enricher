@@ -1,6 +1,6 @@
 # Decisions
 
-Locked design choices for this scaffold. Revisit only with explicit reason.
+Design choices for this scaffold. Revisit only with explicit reason.
 
 ## Locked decisions
 

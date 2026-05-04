@@ -5,16 +5,16 @@
 A small, containerized Dagster workflow that backfills `experiment_date`
 metadata onto Girder `pdv_trace` items by walking the AIMD-L
 `/aimdl/datafiles` endpoint, parsing dates out of file names, and
-writing the metadata back via the Girder REST API. Intended as a
-one-shot backfill — the upstream helix uploader writes
-`experiment_date` on new uploads once it is deployed in production.
+writing the metadata back via the Girder REST API. Intended mostly as a
+one-shot backfill since the upstream helix uploader writes
+`experiment_date` on new uploads, but it's handy as a Dagster just in case it is needed again.  And it let's me deploy it on limited scope pretty easily.
 
 ## Prerequisites
 
 - Docker / Docker Compose (or a local Python ≥3.12 venv)
 - A Girder API key with metadata-write permission on the target items
-- The Girder id of the **collection or user** you want to enrich
-  (folder ids are not accepted by `/aimdl/datafiles`)
+- The Girder id of the **collection or user** you want to enrich (the `baseParentId` scoping). Folder ids do not work: passing one                                                            with `baseParentType=folder` is rejected, and dropping                                                                        
+    `baseParentType` silently swaps your folder id for the some whole collection that is a bit unclear to me. 
 
 ## Quickstart
 
@@ -23,10 +23,11 @@ Run these in order. Do **not** skip the dry run.
 1. **Set credentials.**
    ```
    cp .env.example .env
-   # then edit .env to set GIRDER_API_URL and GIRDER_API_KEY
-   ```
+    ```
+   
+   then edit .env to set GIRDER_API_URL and GIRDER_API_KEY
 
-2. **Probe the endpoint** to confirm reachability and inspect a sample
+2. **Check the endpoint** to confirm reachability and inspect a sample
    record before wiring up the asset:
    ```
    export BASE_PARENT_ID=...        # collection or user id
