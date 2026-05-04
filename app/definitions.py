@@ -317,6 +317,10 @@ def enrich_pdv_trace_experiment_dates(
                     )
                 else:
                     add_metadata_to_item(girder, item_id, update)
+                    log.info(
+                        f"[page {page_index}] UPDATED "
+                        f"item_id={item_id} name={name!r} with {update}"
+                    )
                     page_counters["updated"] += 1
 
             except Exception as exc:
